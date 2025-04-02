@@ -7,89 +7,92 @@ from selenium.webdriver.chrome.options import Options
 import io
 from PIL import Image
 import base64
-import re
-import time
 import os
 import cv2
 import numpy as np
+import time
 from datetime import datetime
 from selenium.webdriver.common.by import By
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
 import threading
-import subprocess  # To convert .avi to .mp4 using ffmpeg
+import subprocess
+import re
+from recording_state import get_state, set_state, is_recording, clear_state
 
 app = Flask(__name__)
 CORS(app, resources={r"/*": {"origins": "*"}})
 
-# Create recordings directory if it doesn't exist
+# Directory to save recordings
 RECORDINGS_DIR = 'recordings'
 if not os.path.exists(RECORDINGS_DIR):
     os.makedirs(RECORDINGS_DIR)
 
-recording = False
 driver = None
 output_file = None
 
-# ✅ Validate URL function
-def is_valid_url(url):
-    regex = re.compile(
-        r'^(https?:\/\/)?'
-        r'(([a-zA-Z0-9_-]+)\.)+[a-zA-Z]{2,6}'
-        r'(\/.*)?$'
-    )
-    return re.match(regex, url) is not None
 
-# ✅ Setup Selenium WebDriver
+def is_valid_url(url):
+    """Ensure the URL is properly formatted."""
+    if not url:
+        return False
+    url = url.strip()
+    if not re.match(r'^(http|https)://', url):
+        url = 'https://' + url  # Ensure the protocol is added
+    return url
+
+
 def setup_driver():
+    """Initialize Selenium WebDriver with Chrome options."""
     options = Options()
-    options.add_argument('--headless')
+    options.add_argument('--headless')  # Use standard headless mode for compatibility
     options.add_argument('--no-sandbox')
     options.add_argument('--disable-dev-shm-usage')
     options.add_argument('--disable-gpu')
     options.add_argument('--start-maximized')
-    return webdriver.Chrome(service=Service(ChromeDriverManager().install()), options=options)
+    options.add_argument('--window-size=1366,768')  # Set a fixed window size
+    options.add_argument('--disable-extensions')
+    options.add_argument('--disable-infobars')
+    options.add_argument('--disable-notifications')
+    options.add_argument('--disable-popup-blocking')
+    options.add_argument('--disable-save-password-bubble')
+    options.add_argument('--disable-translate')
+    options.add_argument('--ignore-certificate-errors')
+    options.add_argument('--ignore-ssl-errors')
+    options.add_experimental_option('excludeSwitches', ['enable-automation'])
+    options.add_experimental_option('useAutomationExtension', False)
+    options.add_argument('--disable-web-security')
+    options.add_argument('--disable-features=IsolateOrigins,site-per-process')
 
-# ✅ Get Full Page Dimensions
-def get_page_dimensions(driver):
-    total_width = driver.execute_script("return document.body.scrollWidth;")
-    total_height = driver.execute_script("return document.body.scrollHeight;")
-    viewport_width = driver.execute_script("return window.innerWidth;")
-    viewport_height = driver.execute_script("return window.innerHeight;")
-    width = max(total_width, viewport_width)
-    height = max(total_height, viewport_height)
-    
-    # Ensure even dimensions (OpenCV requires this)
-    width = width if width % 2 == 0 else width - 1
-    height = height if height % 2 == 0 else height - 1
-    
-    return width, height
+    try:
+        service = Service(ChromeDriverManager().install())
+        driver = webdriver.Chrome(service=service, options=options)
+        driver.set_page_load_timeout(60)  # Increased timeout
+        return driver
+    except Exception as e:
+        print(f"Error setting up ChromeDriver: {str(e)}")
+        raise
 
-# ✅ Capture Screenshot API
+
 @app.route('/capture', methods=['POST'])
 def capture_screenshot():
+    """Capture a screenshot of the given URL."""
+    driver = None
     try:
         data = request.get_json()
-        url = data.get('url', '')
+        url = is_valid_url(data.get('url', ''))
 
-        if not is_valid_url(url):
-            return jsonify({'error': 'Invalid URL'}), 400
+        if not url:
+            return jsonify({'error': 'Invalid URL format'}), 400
 
         driver = setup_driver()
         driver.get(url)
 
-        WebDriverWait(driver, 10).until(
-            EC.presence_of_element_located((By.TAG_NAME, "body"))
-        )
+        # Wait for the page to load
+        WebDriverWait(driver, 15).until(EC.presence_of_element_located((By.TAG_NAME, "body")))
+        time.sleep(2)  # Additional wait for dynamic content
 
-        # ✅ Ensure window is maximized to capture full content
-        driver.maximize_window()
-        time.sleep(2)  # Allow some time for resizing to take effect
-
-        # ✅ Take a full-page screenshot
         screenshot = driver.get_screenshot_as_png()
-        driver.quit()
-
         image = Image.open(io.BytesIO(screenshot))
         img_io = io.BytesIO()
         image.convert('RGB').save(img_io, 'JPEG', quality=80)
@@ -99,139 +102,199 @@ def capture_screenshot():
         return jsonify({'base64': base64_image})
 
     except Exception as e:
-        print(f"Screenshot error: {str(e)}")
         return jsonify({'error': str(e)}), 500
+    finally:
+        if driver:
+            driver.quit()
 
-# ✅ Start Recording API
+
 @app.route('/start-recording', methods=['POST'])
 def start_recording():
-    global recording, driver, output_file
-    
-    try:
-        data = request.get_json()
-        url = data.get('url', '')
-        duration = int(data.get('duration', 30))  # Ensure duration is an integer
+    """Start screen recording for a specified duration."""
+    global driver, output_file
 
-        if not is_valid_url(url):
+    try:
+        # Always clean up any existing recording first
+        if driver:
+            driver.quit()
+            driver = None
+        output_file = None
+        clear_state()
+        time.sleep(1)  # Wait for cleanup
+
+        data = request.get_json()
+        url = is_valid_url(data.get('url', ''))
+        duration = int(data.get('duration', 5))  # Changed default to 5 seconds
+
+        if not url:
             return jsonify({'error': 'Invalid URL'}), 400
 
-        if not url.startswith(('http://', 'https://')):
-            url = 'http://' + url
-
-        # Setup recording
+        print(f"Starting new recording for URL: {url}, duration: {duration}")
         timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
         output_file = os.path.join(RECORDINGS_DIR, f'recording_{timestamp}.mp4')
         
+        # Ensure the recordings directory exists
+        os.makedirs(RECORDINGS_DIR, exist_ok=True)
+        
+        # Ensure the output file path is valid
+        if not output_file or not isinstance(output_file, str):
+            raise ValueError("Invalid output file path")
+
         driver = setup_driver()
         driver.get(url)
 
-        # Wait for page to load
-        WebDriverWait(driver, 10).until(
-            EC.presence_of_element_located((By.TAG_NAME, "body"))
-        )
+        WebDriverWait(driver, 15).until(EC.presence_of_element_located((By.TAG_NAME, "body")))
 
-        # Get page dimensions and set window size
-        width, height = get_page_dimensions(driver)
-        driver.set_window_size(width, height)
-
-        # Start recording
-        recording = True
-        
-        # Start recording in a separate thread
-        recording_thread = threading.Thread(target=record_screen, args=(duration, width, height))
-        recording_thread.start()
+        set_state(True)
+        threading.Thread(target=record_screen, args=(duration,)).start()
 
         return jsonify({'success': True})
 
     except Exception as e:
-        print(f"Start recording error: {str(e)}")
+        print(f"Error in start_recording: {str(e)}")
+        # Clean up on error
+        if driver:
+            driver.quit()
+            driver = None
+        output_file = None
+        clear_state()
         return jsonify({'error': str(e)}), 500
 
-# ✅ Stop Recording API
+
 @app.route('/stop-recording', methods=['POST'])
 def stop_recording():
-    global recording, driver, output_file
-    
+    """Stop screen recording and return the recorded file as base64."""
+    global driver, output_file
+
     try:
-        recording = False
+        print("Stopping recording...")
+        set_state(False)
+        time.sleep(1)
+
         if driver:
             driver.quit()
             driver = None
 
         if output_file and os.path.exists(output_file):
-            absolute_path = os.path.abspath(output_file)
-            file_size = os.path.getsize(output_file)
-            
-            with open(output_file, 'rb') as video_file:
-                video_base64 = base64.b64encode(video_file.read()).decode('utf-8')
-            
-            return jsonify({
-                'success': True,
-                'base64': video_base64,
-                'fileInfo': {
-                    'path': absolute_path,
-                    'size': file_size,
-                    'filename': os.path.basename(output_file)
-                }
-            })
+            print(f"Recording file found: {output_file}")
+            try:
+                with open(output_file, 'rb') as video_file:
+                    video_base64 = base64.b64encode(video_file.read()).decode('utf-8')
+                
+                # Get the filename for the response
+                filename = os.path.basename(output_file)
+                
+                # Clean up after successful stop
+                temp_output_file = output_file
+                output_file = None
+                
+                return jsonify({
+                    'success': True, 
+                    'base64': video_base64, 
+                    'filename': filename
+                })
+            except Exception as e:
+                print(f"Error reading recording file: {str(e)}")
+                return jsonify({'error': 'Failed to read recording file'}), 500
         else:
-            return jsonify({'error': 'Recording file not found'}), 404
+            print(f"Recording file not found at path: {output_file}")
+            # Clean up even if file doesn't exist
+            output_file = None
+            return jsonify({'success': True, 'message': 'No recording file found'})
 
     except Exception as e:
-        print(f"Stop recording error: {str(e)}")
+        print(f"Error in stop_recording: {str(e)}")
+        # Clean up on error
+        output_file = None
         return jsonify({'error': str(e)}), 500
 
-# ✅ Screen Recording Function
-def record_screen(duration, width, height):
-    global recording, driver, output_file
-    
+
+def record_screen(duration):
+    """Record the screen for the given duration."""
+    global driver, output_file
+
     try:
-        # Setup video writer with actual page dimensions
-        fourcc = cv2.VideoWriter_fourcc(*'mp4v')
-        out = cv2.VideoWriter(output_file, fourcc, 20.0, (width, height))
-        
+        if not output_file or not isinstance(output_file, str):
+            raise ValueError("Invalid output file path")
+
+        print(f"Starting screen recording for {duration} seconds")
+        temp_avi = output_file.replace('.mp4', '.avi')
+        fourcc = cv2.VideoWriter_fourcc(*'XVID')
+        out = cv2.VideoWriter(temp_avi, fourcc, 20.0, (1366, 768))
+
+        if not out.isOpened():
+            raise ValueError("Failed to create video writer")
+
         start_time = time.time()
-        print(f"Starting recording for {duration} seconds...")
-        
-        while recording and (time.time() - start_time) < duration:
-            # Capture screenshot
-            screenshot = driver.get_screenshot_as_png()
-            image = Image.open(io.BytesIO(screenshot))
-            
-            # Convert to OpenCV format
-            opencv_image = cv2.cvtColor(np.array(image), cv2.COLOR_RGB2BGR)
-            
-            # Write frame
-            out.write(opencv_image)
-            
-            # Small delay to control frame rate
-            time.sleep(0.05)
-            
-            # Print progress
-            elapsed = time.time() - start_time
-            if elapsed % 5 == 0:  # Print every 5 seconds
-                print(f"Recording progress: {elapsed:.1f}/{duration} seconds")
-        
-        print("Recording completed!")
-        # Release resources
+
+        while is_recording() and (time.time() - start_time) < duration:
+            try:
+                screenshot = driver.get_screenshot_as_png()
+                image = Image.open(io.BytesIO(screenshot))
+                frame = cv2.cvtColor(np.array(image.resize((1366, 768))), cv2.COLOR_RGB2BGR)
+                out.write(frame)
+                time.sleep(0.05)
+            except Exception as e:
+                print(f"Error capturing frame: {str(e)}")
+                break
+
+        print("Recording completed or stopped")
+        set_state(False)
         out.release()
-        
+
+        # Convert to MP4
+        print("Converting to MP4...")
+        ffmpeg_cmd = [
+            'ffmpeg', '-y',
+            '-i', temp_avi,
+            '-c:v', 'libx264',
+            '-preset', 'medium',
+            '-crf', '23',
+            output_file
+        ]
+        subprocess.run(ffmpeg_cmd, capture_output=True)
+
+        if os.path.exists(temp_avi):
+            os.remove(temp_avi)
+        print("Conversion completed")
+
     except Exception as e:
         print(f"Recording error: {str(e)}")
+        set_state(False)
     finally:
-        recording = False
+        print("Cleaning up resources...")
+        # Clean up resources
+        if driver:
+            driver.quit()
+            driver = None
+        output_file = None
+        print("Cleanup completed")
 
-# ✅ Get Recordings Info
+
 @app.route('/recordings-info', methods=['GET'])
 def get_recordings_info():
+    """Retrieve information about recorded files."""
     try:
-        recordings = [
-            {'filename': f, 'path': os.path.abspath(os.path.join(RECORDINGS_DIR, f))}
-            for f in os.listdir(RECORDINGS_DIR) if os.path.isfile(os.path.join(RECORDINGS_DIR, f))
-        ]
+        recordings = [{'filename': f, 'path': os.path.abspath(os.path.join(RECORDINGS_DIR, f))}
+                      for f in os.listdir(RECORDINGS_DIR) if os.path.isfile(os.path.join(RECORDINGS_DIR, f))]
         return jsonify({'recordings': recordings})
     except Exception as e:
         return jsonify({'error': str(e)}), 500
+
+
+@app.route('/recording-status', methods=['GET'])
+def get_recording_status():
+    """Check if a recording is currently in progress."""
+    return jsonify({'isRecording': is_recording()})
+
+
+def cleanup_old_recordings():
+    current_time = time.time()
+    for filename in os.listdir(RECORDINGS_DIR):
+        filepath = os.path.join(RECORDINGS_DIR, filename)
+        if os.path.getmtime(filepath) < current_time - 86400:  # 24 மணி நேரத்திற்கு மேல்
+            os.remove(filepath)
+
 
 if __name__ == '__main__':
     app.run(host='0.0.0.0', debug=True, port=5001)

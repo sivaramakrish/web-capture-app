@@ -25,6 +25,10 @@ wheels/
 *.egg-info/
 .installed.cfg
 *.egg
+venv/
+.env
+.venv
+ENV/
 
 # Expo
 .expo/
@@ -67,3 +71,8 @@ yarn-error.*
 # Project specific
 recordings/
 screenshots/
+*.mp4
+*.avi
+*.jpg
+*.jpeg
+*.png
