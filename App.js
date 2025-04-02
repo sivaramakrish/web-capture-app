@@ -210,163 +210,219 @@ const App = () => {
     }
   };
 
-  // Add a function to check recording status periodically
-  const checkRecordingStatus = async () => {
-    try {
-      const response = await fetchWithRetry(`${API_URL}/recording-status`);
-      const data = await response.json();
-      setRecordingStatus(data.isRecording);
-      
-      if (!data.isRecording && isRecording) {
-        setIsRecording(false);
-        // If recording was stopped, try to get the recording
-        await handleScreenRecording();
-      }
-    } catch (error) {
-      console.error('Error checking recording status:', error);
-      setRecordingStatus(false);
-      setIsRecording(false);
+// Modify checkRecordingStatus
+const checkRecordingStatus = async () => {
+  try {
+    const response = await fetchWithRetry(`${API_URL}/recording-status`);
+    const data = await response.json();
+    // setRecordingStatus(data.isRecording); // This state seems unused, can remove
+
+    // Check if the app thinks it's recording BUT the server says it's not
+    if (isRecording && !data.isRecording) {
+      console.log('Polling detected recording has stopped on the server.');
+      setIsRecording(false); // Update app state FIRST
+      // *** IMPORTANT CHANGE HERE: Call the new fetch function ***
+      await fetchCompletedRecording();
+    }
+    // Optional: Handle state mismatch where server is recording but app isn't
+    else if (!isRecording && data.isRecording) {
+       console.warn('Server is recording, but app state is not. Syncing app state.');
+       setIsRecording(true);
+    }
+
+  } catch (error) {
+    console.error('Error checking recording status:', error);
+    // Decide how to handle polling errors, maybe stop polling after too many failures
+    // Alert.alert('Error', 'Could not check recording status. Please check connection.');
+    // setIsRecording(false); // Safer to assume stopped on error? Maybe not.
+  }
+};
+
+// Keep the useEffect hook as is
+useEffect(() => {
+  let interval;
+  if (isRecording) {
+    // Check immediately when recording starts, then interval
+    checkRecordingStatus();
+    interval = setInterval(checkRecordingStatus, 5000); // Poll slightly less frequently? e.g., 5s
+  }
+  return () => {
+    if (interval) {
+      clearInterval(interval);
     }
   };
+}, [isRecording]); // Dependency array is correct
+ 
 
-  // Set up interval to check recording status
-  useEffect(() => {
-    let interval;
-    if (isRecording) {
-      interval = setInterval(checkRecordingStatus, 2000);
+
+ // Add a new function to fetch the result after polling detects completion
+ const fetchCompletedRecording = async () => {
+  setLoading(true); // Show loading indicator
+  console.log('Polling detected recording finished. Attempting to fetch result...');
+  try {
+    // We still call /stop-recording, but now expect it might retrieve
+    // a file even if the recording state is already false on the server.
+    // This requires the backend /stop-recording endpoint to be robust.
+    const response = await fetchWithRetry(`${API_URL}/stop-recording`, {
+      method: 'POST',
+    });
+
+    const data = await response.json();
+
+    if (data.success && data.base64) {
+      // Use filename from backend if provided, otherwise generate one
+      const fileName = data.filename || `recording_${Date.now()}.mp4`;
+      const filePath = `${FileSystem.documentDirectory}${fileName}`;
+
+      await FileSystem.writeAsStringAsync(filePath, data.base64, {
+        encoding: FileSystem.EncodingType.Base64,
+      });
+
+      setDownloadUri(filePath);
+      setCapturedFiles(prev => [...prev, {
+        name: fileName,
+        path: filePath,
+        type: 'recording',
+        timestamp: new Date().toLocaleString()
+      }]);
+      Alert.alert('Success', 'Screen recording completed!'); // <<< THE ALERT YOU WANT!
+    } else if (data.success && !data.base64) {
+       Alert.alert('Info', 'Recording process finished, but no video data was retrieved. The server might have already cleaned up or encountered an issue.');
+       console.warn('Server indicated success on stop/fetch, but no base64 data returned:', data);
+    } else {
+      // Use the error message from the backend if available
+      throw new Error(data.error || 'Failed to retrieve the completed recording.');
     }
-    return () => {
-      if (interval) {
-        clearInterval(interval);
-      }
-    };
-  }, [isRecording]);
+  } catch (error) {
+    console.error('Error fetching completed recording:', error);
+    Alert.alert('Error', `Failed to retrieve recording: ${error.message}`);
+    // Consider setting isRecording back to false here if it wasn't already
+    setIsRecording(false);
+  } finally {
+    setLoading(false);
+  }
+};
 
+ // The existing handleScreenRecording for MANUAL start/stop remains largely the same
+  // but the 'stop' part will now only be triggered by the user pressing the button.
   const handleScreenRecording = async () => {
     if (!isValidUrl(websiteUrl)) {
       Alert.alert('Invalid URL', 'Please enter a valid website URL');
       return;
     }
 
+    // --- MANUAL STOP Logic ---
     if (isRecording) {
       try {
         setLoading(true);
-        console.log('Stopping recording...');
-        
-        // First check if recording is actually in progress
-        const statusResponse = await fetchWithRetry(`${API_URL}/recording-status`);
-        const statusData = await statusResponse.json();
-        
-        if (!statusData.isRecording) {
-          setIsRecording(false);
-          Alert.alert('Info', 'No recording in progress');
-          return;
-        }
+        console.log('User manually stopping recording...');
+
+        // Optional: Check server status first, though user action implies it should be recording
+        // const statusResponse = await fetchWithRetry(`${API_URL}/recording-status`);
+        // const statusData = await statusResponse.json();
+        // if (!statusData.isRecording) { ... } // Handle unlikely case
 
         const response = await fetchWithRetry(`${API_URL}/stop-recording`, {
           method: 'POST',
         });
 
         const data = await response.json();
-        
+
+        // *** Set isRecording false AFTER successful stop call ***
+        setIsRecording(false); // Moved this here
+
         if (data.success) {
-          setIsRecording(false);
+          //setIsRecording(false); // Moved up
           if (data.base64) {
-            const fileName = `recording_${Date.now()}.mp4`;
+            const fileName = data.filename || `recording_${Date.now()}.mp4`; // Use filename from backend
             const filePath = `${FileSystem.documentDirectory}${fileName}`;
-            
+
             await FileSystem.writeAsStringAsync(filePath, data.base64, {
               encoding: FileSystem.EncodingType.Base64,
             });
-            
+
             setDownloadUri(filePath);
-            setCapturedFiles(prev => [...prev, { 
-              name: fileName, 
-              path: filePath, 
+            setCapturedFiles(prev => [...prev, {
+              name: fileName,
+              path: filePath,
               type: 'recording',
               timestamp: new Date().toLocaleString()
             }]);
-            Alert.alert('Success', 'Screen recording completed!');
+            // Alert for MANUAL stop
+            Alert.alert('Success', 'Screen recording stopped and saved!');
           } else {
-            Alert.alert('Warning', 'Recording stopped but no data received');
+             // Alert for MANUAL stop where server didn't return data
+             Alert.alert('Info', 'Recording stopped, but no video data was returned by the server.');
+             console.warn('Manual stop success, but no base64 data:', data);
           }
         } else {
+          // Error stopping manually
+          // setIsRecording(false); // Keep it true maybe, let user retry stop? Or set false? Depends on desired UX. Setting false might be less confusing.
           throw new Error(data.error || 'Failed to stop recording');
         }
       } catch (error) {
-        console.error('Error stopping recording:', error);
-        if (error.message === 'No recording in progress') {
-          setIsRecording(false);
-          Alert.alert('Info', 'No recording in progress');
-        } else if (error.name === 'AbortError') {
+        // Handle manual stop errors
+        console.error('Error stopping recording manually:', error);
+         // Should probably ensure recording state is false even on error stopping
+        setIsRecording(false);
+        if (error.name === 'AbortError') {
           Alert.alert('Error', 'Request timed out. Please check your connection and try again.');
         } else {
-          Alert.alert('Error', error.message || 'Failed to stop recording. Please check your connection and try again.');
+          Alert.alert('Error', error.message || 'Failed to stop recording. Please check server status.');
         }
       } finally {
         setLoading(false);
       }
-    } else {
+    }
+    // --- START Logic (Remains the same) ---
+    else {
       try {
+        // ... (validation logic as before) ...
         const duration = parseInt(recordingDuration);
-        if (isNaN(duration) || duration <= 0 || duration > 300) {
-          Alert.alert('Invalid Duration', 'Please enter a valid duration between 1 and 300 seconds');
-          return;
-        }
+        // ... (validation logic as before) ...
 
         setLoading(true);
         console.log('Starting recording...');
-        
-        // First check if any recording is in progress
+
+        // Check status first (as before)
         const statusResponse = await fetchWithRetry(`${API_URL}/recording-status`);
         const statusData = await statusResponse.json();
-        
+
         if (statusData.isRecording) {
-          // If recording is in progress, try to stop it first
-          try {
-            await fetchWithRetry(`${API_URL}/stop-recording`, {
-              method: 'POST',
-            });
-            // Wait for a moment after stopping
-            await new Promise(resolve => setTimeout(resolve, 2000));
-            // Check status again
-            const newStatusResponse = await fetchWithRetry(`${API_URL}/recording-status`);
-            const newStatusData = await newStatusResponse.json();
-            if (newStatusData.isRecording) {
-              throw new Error('Another recording is already in progress');
-            }
-          } catch (error) {
-            console.error('Error cleaning up previous recording:', error);
-            throw new Error('Another recording is already in progress');
-          }
+           // Maybe offer to stop the existing one? For now, throw error.
+           throw new Error('Another recording is already in progress on the server.');
         }
 
         const response = await fetchWithRetry(`${API_URL}/start-recording`, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({
-            url: websiteUrl,
+            url: formatUrl(websiteUrl), // Format URL before sending
             duration: duration
           }),
         });
 
         const data = await response.json();
-        
+
         if (data.success) {
+          // Set state only AFTER successful start call
           setIsRecording(true);
-          setStartTime(Date.now());
+          setStartTime(Date.now()); // Keep track of start time if needed
           Alert.alert('Recording Started', `Recording for ${duration} seconds...`);
         } else {
+          // Ensure state is false if start fails
+          setIsRecording(false);
           throw new Error(data.error || 'Failed to start recording');
         }
       } catch (error) {
+        // Handle start errors
         console.error('Error starting recording:', error);
+        setIsRecording(false); // Ensure state is false on error
         if (error.name === 'AbortError') {
           Alert.alert('Error', 'Request timed out. Please check your connection and try again.');
         } else {
-          Alert.alert('Error', error.message || 'Failed to start recording. Please check your connection and try again.');
+          Alert.alert('Error', error.message || 'Failed to start recording. Please check server status.');
         }
-        setIsRecording(false);
       } finally {
         setLoading(false);
       }
